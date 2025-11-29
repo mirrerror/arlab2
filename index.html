@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AR Interaction Lab (Grades 7, 9, 10)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js/aframe/build/aframe-ar.js"></script>
+
+  <style>
+    body { margin:0; overflow:hidden; }
+    
+    /* HUD / UI Styling */
+    .hud {
+      position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+      display: grid; grid-template-columns: repeat(5, auto); gap: 8px;
+      font: 600 14px/1 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      z-index: 10; pointer-events: none;
+    }
+    .hud.hidden { display: none; }
+    .hud button {
+      pointer-events: auto;
+      padding: 10px 12px; border: 0; border-radius: 10px;
+      background: rgba(255,255,255,.9);
+      font-size: 20px;
+    }
+  </style>
+
+  <script>
+  // ---------- Utilities ----------
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // --- [Grade 7] --- Global state for sequential markers
+  let marker1Found = false;
+
+  // --- [Grade 7] --- Logic to manage object visibility based on sequence
+  AFRAME.registerComponent('marker-logic', {
+    init: function () {
+      console.log('DEBUG: marker-logic component initialized for', this.el.id);
+      
+      this.modelIsReady = false;
+      this.markerIsVisible = false;
+
+      // Listen for the model to finish loading
+      this.el.addEventListener('model-loaded', () => {
+        console.log('DEBUG: Model', this.el.id, 'is fully loaded.');
+        this.modelIsReady = true;
+        this.checkVisibility();
+      });
+
+      // Listen for the parent marker being found
+      this.el.sceneEl.addEventListener('markerFound', (e) => {
+        if (this.el.parentNode.id === e.target.id) {
+          console.log('DEBUG: Marker 2 (Ronnie Radke) found.');
+          this.markerIsVisible = true;
+          this.checkVisibility();
+        }
+      });
+      
+      this.el.sceneEl.addEventListener('markerLost', (e) => {
+        if (this.el.parentNode.id === e.target.id) {
+          console.log('DEBUG: Marker 2 (Ronnie Radke) lost.');
+          this.markerIsVisible = false;
+          this.checkVisibility();
+        }
+      });
+    },
+
+    checkVisibility: function () {
+      // ONLY show if model is loaded, marker is visible, AND Marker 1 was previously found
+      if (this.modelIsReady && this.markerIsVisible && marker1Found) {
+        console.log('DEBUG: All conditions met. SHOWING model.');
+        this.el.setAttribute('visible', true);
+      } else {
+        console.log('DEBUG: Conditions not met. HIDING model.');
+        this.el.setAttribute('visible', false);
+      }
+    }
+  });
+
+  // ---------- 1) Tap / doubletap / longpress ----------
+  AFRAME.registerComponent('tap-gestures', {
+    schema: {longMs:{default:500}},
+    init () {
+      let lastTap = 0, pressTimer = null, down = false;
+      this.el.addEventListener('mousedown', () => {
+        down = true;
+        const now = performance.now();
+        if (now - lastTap < 300) this.el.emit('doubletap');
+        lastTap = now;
+        pressTimer = setTimeout(() => { if (down) this.el.emit('longpress'); }, this.data.longMs);
+      });
+      this.el.addEventListener('mouseup', () => {
+        down = false;
+        clearTimeout(pressTimer);
+        this.el.emit('tap');
+      });
+      this.el.addEventListener('touchstart', e => e.preventDefault(), {passive:false});
+    }
+  });
+
+  // ---------- 2) Drag on a plane (marker plane) ----------
+  AFRAME.registerComponent('drag-on-plane', {
+    schema: { plane: {type: 'selector'}, yOffset: {default: 0.25}, radius: {default: 2.0} },
+    init () {
+      this.dragging = false;
+      this.scene = this.el.sceneEl;
+      this.rayEl = document.querySelector('#ray');
+      this.el.addEventListener('mousedown', () => this.dragging = true);
+      window.addEventListener('mouseup',   () => this.dragging = false);
+      window.addEventListener('touchend',  () => this.dragging = false);
+      this.scene.addEventListener('mousemove', (e)=> this.updateDrag());
+      this.scene.addEventListener('touchmove', (e)=> this.updateDrag());
+    },
+    updateDrag () {
+      if (!this.dragging) return;
+      if (!this.data.plane) return;
+      const raycaster = this.rayEl.getObject3D('raycaster');
+      if (!raycaster) return;
+      const planeMesh = this.data.plane.getObject3D('mesh');
+      if (!planeMesh) return;
+
+      planeMesh.updateMatrixWorld();
+      const normal = new THREE.Vector3(0,1,0).applyQuaternion(planeMesh.getWorldQuaternion(new THREE.Quaternion()));
+      const point  = planeMesh.getWorldPosition(new THREE.Vector3());
+      const plane  = new THREE.Plane().setFromNormalAndCop_lanarPoint(normal, point);
+
+      const ray = raycaster.ray;
+      const hit = new THREE.Vector3();
+      if (ray.intersectPlane(plane, hit)) {
+        const local = this.el.parentEl.object3D.worldToLocal(hit.clone());
+        const r = Math.hypot(local.x, local.z);
+        const maxR = this.data.radius;
+        if (r > maxR){
+          const k = maxR / r;
+          local.x *= k; local.z *= k;
+        }
+        this.el.setAttribute('position', `${local.x} ${this.data.yOffset} ${local.z}`);
+      }
+    }
+  });
+
+  // ---------- 3) Pinch to scale ----------
+  AFRAME.registerComponent('pinch-scale', {
+    schema: {min:{default:0.1}, max:{default:5}},
+    init(){
+      this.active = false; this.startD = 0; this.startScale = null;
+      const onStart = (e) => {
+        if (e.touches && e.touches.length === 2){
+          this.active = true;
+          this.startD = this.dist(e.touches[0], e.touches[1]);
+          this.startScale = Object.assign({}, this.el.getAttribute('scale'));
+        }
+      };
+      const onMove = (e) => {
+        if (!this.active || !e.touches || e.touches.length < 2) return;
+        const d = this.dist(e.touches[0], e.touches[1]);
+        const mult = d / this.startD;
+        const start = this.startScale;
+        const ns = {
+          x: clamp(start.x * mult, this.data.min * start.x, this.data.max * start.x),
+          y: clamp(start.y * mult, this.data.min * start.y, this.data.max * start.y),
+          z: clamp(start.z * mult, this.data.min * start.z, this.data.max * start.z),
+        };
+        this.el.setAttribute('scale', ns);
+      };
+      const onEnd = () => this.active = false;
+      window.addEventListener('touchstart', onStart, {passive:false});
+      window.addEventListener('touchmove',  onMove,  {passive:false});
+      window.addEventListener('touchend',   onEnd);
+      window.addEventListener('touchcancel',onEnd);
+    },
+    dist(a,b){ const dx=a.clientX-b.clientX, dy=a.clientY-b.clientY; return Math.hypot(dx,dy); }
+  });
+
+  // ---------- 4) Twist to rotate (two-finger) ----------
+  AFRAME.registerComponent('twist-rotate', {
+    schema:{degPerRad:{default:57.2958}},
+    init(){
+      this.active = false; this.startA = 0; this.startRotY = 0;
+      const angle = (a,b)=> Math.atan2(b.clientY-a.clientY, b.clientX-a.clientX);
+      const onStart = (e)=>{
+        if (e.touches && e.touches.length === 2){
+          this.active = true;
+          this.startA = angle(e.touches[0], e.touches[1]);
+          this.startRotY = this.el.getAttribute('rotation').y;
+        }
+      };
+      const onMove = (e)=>{
+        if (!this.active || !e.touches || e.touches.length < 2) return;
+        const a = angle(e.touches[0], e.touches[1]);
+        const delta = (a - this.startA) * this.data.degPerRad;
+        const r = this.el.getAttribute('rotation');
+        this.el.setAttribute('rotation', {x:r.x, y:this.startRotY + delta, z:r.z});
+      };
+      const onEnd = ()=> this.active = false;
+      window.addEventListener('touchstart', onStart, {passive:false});
+      window.addEventListener('touchmove',  onMove,  {passive:false});
+      window.addEventListener('touchend',   onEnd);
+      window.addEventListener('touchcancel',onEnd);
+    }
+  });
+
+  // ---------- 5) Spin toggler + random color ----------
+  AFRAME.registerComponent('spin-toggle', {
+    schema:{speed:{default:4000}},
+    init(){
+      this.spinning = false;
+      this.el.addEventListener('toggle-spin', ()=> {
+        this.spinning = !this.spinning;
+        if (this.spinning) {
+          this.el.setAttribute('animation__spin',
+            `property: rotation; to: 0 360 0; loop: true; dur: ${this.data.speed}`);
+        } else {
+          this.el.removeAttribute('animation__spin');
+        }
+      });
+      this.el.addEventListener('random-color', ()=> {
+        // Only works if the entity has a material color component (like a-box)
+        if (this.el.nodeName.toLowerCase() === 'a-box') {
+          const colors = ['#4CC3D9','#FFC65D','#7BC8A4','#EF2D5E','#FFFFFF'];
+          const c = colors[Math.floor(Math.random()*colors.length)];
+          this.el.setAttribute('material','color',c);
+        }
+      });
+    }
+  });
+  </script>
+</head>
+<body>
+  <div class="hud" id="hud">
+    <button id="btn-rot-l">⟲</button>
+    <button id="btn-rot-r">⟳</button>
+    <button id="btn-scale--">−</button>
+    <button id="btn-scale-+">＋</button>
+    <button id="btn-color">🎨</button>
+  </div>
+
+  <a-scene
+    embedded
+    renderer="colorManagement: true; physicallyCorrectLights: true"
+    xr-mode-ui="enabled: false"
+    arjs="sourceType: webcam; debugUIEnabled: false; detectionMode: mono_and_matrix; matrixCodeType: 3x3;">
+
+    <a-entity id="ray" cursor="rayOrigin: mouse" raycaster="objects: .raytarget"></a-entity>
+
+    <a-entity light="type: ambient; intensity: 0.8"></a-entity>
+    <a-entity light="type: directional; intensity: 0.6" position="0 1 1"></a-entity>
+
+    <a-marker type="pattern" url="salute.patt" id="marker1">
+      <a-plane id="dragplane1" class="raytarget"
+               position="0 0 0" rotation="-90 0 0" width="10" height="10"
+               material="opacity: 0; transparent: true"></a-plane>
+
+      <a-box id="cube" class="raytarget"
+             position="0 0.25 0" depth="0.5" height="0.5" width="0.5"
+             material="metalness:0.1; roughness:0.6; color:#4CC3D9"
+             tap-gestures spin-toggle
+             drag-on-plane="plane: #dragplane1; yOffset: 0.25; radius: 2.0"
+             pinch-scale twist-rotate>
+      </a-box>
+    </a-marker>
+    
+    <a-marker type="pattern" url="ronnieradke.patt" id="marker2">
+      <a-plane id="dragplane2" class="raytarget"
+               position="0 0 0" rotation="-90 0 0" width="10" height="10"
+               material="opacity: 0; transparent: true"></a-plane>
+
+      <a-gltf-model id="model" src="scene.gltf" class="raytarget"
+              position="0 0.1 0" scale="0.1 0.1 0.1" 
+              marker-logic
+              tap-gestures spin-toggle
+              drag-on-plane="plane: #dragplane2; yOffset: 0.1; radius: 2.0"
+              pinch-scale="min: 0.1; max: 5" 
+              twist-rotate>
+              
+          <a-box color="red" position="0 0.5 0" scale="0.5 0.5 0.5"></a-box>
+          
+      </a-gltf-model>
+    </a-marker>
+
+    <a-entity camera></a-entity>
+  </a-scene>
+
+  <script>
+    const hud  = document.getElementById('hud');
+    const cube = document.getElementById('cube');
+    const model = document.getElementById('model');
+
+    // Listen for model errors
+    model.addEventListener('model-error', (e) => {
+      console.error('*** DEBUG: MODEL FAILED TO LOAD ***', e.detail);
+    });
+
+    // --- [Grade 7] --- Listen for marker1 to be found
+    document.getElementById('marker1').addEventListener('markerFound', () => {
+      console.log('DEBUG: Marker 1 (Salute) FOUND. Sequence Unlocked.');
+      marker1Found = true;
+      
+      // Update logic in case Marker 2 is already in view
+      if (model.components['marker-logic']) {
+        model.components['marker-logic'].checkVisibility();
+      }
+    });
+
+    // --- HUD Button Logic ---
+    function getActiveObject() {
+      // Prioritize model if visible
+      if (model && model.getAttribute('visible') === true) return model;
+      // Fallback to cube if visible (technically marker1 usually visible first)
+      if (cube) return cube;
+      return null;
+    }
+
+    document.getElementById('btn-rot-l').addEventListener('click', () => nudgeRot(-15));
+    document.getElementById('btn-rot-r').addEventListener('click', () => nudgeRot( 15));
+    function nudgeRot(delta){
+      const obj = getActiveObject();
+      if (!obj) return;
+      const r = obj.getAttribute('rotation');
+      obj.setAttribute('rotation', {x:r.x, y:r.y + delta, z:r.z});
+    }
+
+    document.getElementById('btn-scale--').addEventListener('click', () => nudgeScale(0.9));
+    document.getElementById('btn-scale-+').addEventListener('click', () => nudgeScale(1.1));
+    function nudgeScale(mult){
+      const obj = getActiveObject();
+      if (!obj) return;
+      
+      const s = obj.getAttribute('scale');
+      const minScale = (obj.id === 'model') ? 0.1 : 0.2;
+      const maxScale = (obj.id === 'model') ? 5 : 3;
+
+      obj.setAttribute('scale', {
+        x: clamp(s.x * mult, minScale, maxScale),
+        y: clamp(s.y * mult, minScale, maxScale),
+        z: clamp(s.z * mult, minScale, maxScale)
+      });
+    }
+
+    document.getElementById('btn-color').addEventListener('click', () => {
+        const obj = getActiveObject();
+        if (obj) obj.emit('random-color');
+    });
+
+    // Gesture hooks (Taps)
+    cube.addEventListener('tap',       () => cube.emit('toggle-spin'));
+    cube.addEventListener('doubletap', () => cube.emit('random-color'));
+    cube.addEventListener('longpress', () => hud.classList.toggle('hidden'));
+    
+    model.addEventListener('tap',       () => model.emit('toggle-spin'));
+    model.addEventListener('doubletap', () => model.emit('random-color'));
+    model.addEventListener('longpress', () => hud.classList.toggle('hidden'));
+  </script>
+</body>
+</html>
