@@ -12,7 +12,7 @@
     body { 
         margin:0; 
         overflow:hidden; 
-        /* Important: Prevents browser zooming/scrolling while gesturing */
+        /* CRITICAL: Prevents browser zooming/scrolling while gesturing */
         touch-action: none; 
     }
     
@@ -74,8 +74,8 @@
     }
   });
 
-  // ---------- CRITICAL: Gesture Detector ----------
-  // Detects pinch/rotate gestures and emits 'twofingermove'
+  // ---------- CRITICAL: Gesture Detector (Updated for Twist) ----------
+  // Detects pinch (spread) and twist (angle) gestures
   AFRAME.registerComponent('gesture-detector', {
     schema: { element: { default: '' } },
     init: function() {
@@ -105,15 +105,25 @@
       
       const currentState = this.getTouchState(event);
       const previousState = this.internalState.previousState;
+      
       if (previousState) {
         const spreadChange = currentState.spread - previousState.spread;
+        
+        // Calculate angle change for twist
+        let rotationChange = currentState.angle - previousState.angle;
+        // Fix angle wrap-around (e.g. going from 179 to -179 degrees)
+        if (rotationChange > Math.PI) rotationChange -= Math.PI * 2;
+        if (rotationChange < -Math.PI) rotationChange += Math.PI * 2;
+
         const positionChange = {
           x: currentState.position.x - previousState.position.x,
           y: currentState.position.y - previousState.position.y
         };
+        
         this.el.emit("twofingermove", {
           positionChange: positionChange,
           spreadChange: spreadChange,
+          rotationChange: rotationChange,
           startSpread: previousState.spread,
           position: currentState.position
         });
@@ -128,6 +138,7 @@
       const dy = touch0.clientY - touch1.clientY;
       return {
         spread: Math.sqrt(dx * dx + dy * dy),
+        angle: Math.atan2(dy, dx), // Calculate angle for twisting
         position: {
           x: (touch0.clientX + touch1.clientX) / 2,
           y: (touch0.clientY + touch1.clientY) / 2
@@ -144,6 +155,9 @@
       let lastTap = 0;
 
       const startHandler = (e) => {
+        // Only tracking single touch/click interactions here
+        if (e.touches && e.touches.length > 1) return;
+
         const now = Date.now();
         const timeSinceLastTap = now - lastTap;
 
@@ -194,7 +208,8 @@
       window.addEventListener('touchend', this.onUp.bind(this));
     },
     onDown: function (e) {
-      if (e.touches && e.touches.length > 1) return; // Ignore multi-touch
+      // Only allow drag if EXACTLY 1 finger (or mouse)
+      if (e.touches && e.touches.length !== 1) return;
       this.isDragging = true;
     },
     onUp: function () {
@@ -202,7 +217,11 @@
     },
     onMove: function (e) {
       if (!this.isDragging) return;
-      if (e.touches && e.touches.length > 1) return; // Ignore multi-touch
+      // Strict check: Stop dragging if a second finger touches
+      if (e.touches && e.touches.length !== 1) {
+        this.isDragging = false;
+        return;
+      }
 
       let clientX, clientY;
       if (e.touches) {
@@ -240,11 +259,11 @@
     }
   });
 
-  // ---------- 3 & 4) Combined Gesture Handler (Scale & Rotate) ----------
+  // ---------- 3 & 4) Gesture Handler (Twist-Rotate & Pinch-Scale) ----------
   AFRAME.registerComponent('gesture-handler', {
     schema: {
       enabled: { default: true },
-      rotationFactor: { default: 5 },
+      rotationFactor: { default: 5 }, // Multiplier for rotation speed
       minScale: { default: 0.1 },
       maxScale: { default: 5 },
     },
@@ -256,6 +275,7 @@
       this.scaleFactor = 1;
 
       this.el.sceneEl.addEventListener("markerFound", (e) => {
+        // Only set visible if THIS element is inside the found marker
         if (e.target.contains(this.el)) this.isVisible = true;
       });
       this.el.sceneEl.addEventListener("markerLost", (e) => {
@@ -277,7 +297,9 @@
     },
     handleRotation: function (event) {
       if (this.isVisible) {
-        this.el.object3D.rotation.y += event.detail.positionChange.x * this.data.rotationFactor;
+        // Use rotationChange (angle difference) instead of positionChange (pan)
+        // -1 factor makes the rotation follow fingers naturally
+        this.el.object3D.rotation.y -= event.detail.rotationChange * this.data.rotationFactor;
       }
     },
     handleScale: function (event) {
@@ -350,7 +372,7 @@
              tap-gestures 
              spin-toggle
              drag-on-plane="plane: #dragplane1; yOffset: 0.25; radius: 2.0"
-             gesture-handler="minScale: 0.2; maxScale: 3">
+             gesture-handler="minScale: 0.2; maxScale: 3; rotationFactor: 2">
       </a-box>
     </a-marker>
     
@@ -365,7 +387,7 @@
               tap-gestures 
               spin-toggle
               drag-on-plane="plane: #dragplane2; yOffset: 0.1; radius: 2.0"
-              gesture-handler="minScale: 0.05; maxScale: 2">
+              gesture-handler="minScale: 0.05; maxScale: 2; rotationFactor: 2">
               
           <a-box color="red" position="0 0.5 0" scale="0.5 0.5 0.5"></a-box>
       </a-gltf-model>
@@ -407,6 +429,7 @@
       const obj = getActiveObject();
       if (!obj) return;
       const r = obj.getAttribute('rotation');
+      const rad = THREE.Math.degToRad(delta); // Convert degrees to radians if modifying object3D directly, but here we use setAttribute which takes degrees
       obj.setAttribute('rotation', {x:r.x, y:r.y + delta, z:r.z});
     }
 
