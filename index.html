@@ -9,7 +9,12 @@
   <script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js/aframe/build/aframe-ar.js"></script>
 
   <style>
-    body { margin:0; overflow:hidden; }
+    body { 
+        margin:0; 
+        overflow:hidden; 
+        /* Important: Prevents browser zooming/scrolling while gesturing */
+        touch-action: none; 
+    }
     
     /* HUD / UI Styling */
     .hud {
@@ -37,22 +42,16 @@
   // --- [Grade 7] --- Logic to manage object visibility based on sequence
   AFRAME.registerComponent('marker-logic', {
     init: function () {
-      console.log('DEBUG: marker-logic component initialized for', this.el.id);
-      
       this.modelIsReady = false;
       this.markerIsVisible = false;
 
-      // Listen for the model to finish loading
       this.el.addEventListener('model-loaded', () => {
-        console.log('DEBUG: Model', this.el.id, 'is fully loaded.');
         this.modelIsReady = true;
         this.checkVisibility();
       });
 
-      // Listen for the parent marker being found
       this.el.sceneEl.addEventListener('markerFound', (e) => {
         if (this.el.parentNode.id === e.target.id) {
-          console.log('DEBUG: Marker 2 (Ronnie Radke) found.');
           this.markerIsVisible = true;
           this.checkVisibility();
         }
@@ -60,7 +59,6 @@
       
       this.el.sceneEl.addEventListener('markerLost', (e) => {
         if (this.el.parentNode.id === e.target.id) {
-          console.log('DEBUG: Marker 2 (Ronnie Radke) lost.');
           this.markerIsVisible = false;
           this.checkVisibility();
         }
@@ -68,138 +66,229 @@
     },
 
     checkVisibility: function () {
-      // ONLY show if model is loaded, marker is visible, AND Marker 1 was previously found
       if (this.modelIsReady && this.markerIsVisible && marker1Found) {
-        console.log('DEBUG: All conditions met. SHOWING model.');
         this.el.setAttribute('visible', true);
       } else {
-        console.log('DEBUG: Conditions not met. HIDING model.');
         this.el.setAttribute('visible', false);
       }
     }
   });
 
-  // ---------- 1) Tap / doubletap / longpress ----------
-  AFRAME.registerComponent('tap-gestures', {
-    schema: {longMs:{default:500}},
-    init () {
-      let lastTap = 0, pressTimer = null, down = false;
-      this.el.addEventListener('mousedown', () => {
-        down = true;
-        const now = performance.now();
-        if (now - lastTap < 300) this.el.emit('doubletap');
-        lastTap = now;
-        pressTimer = setTimeout(() => { if (down) this.el.emit('longpress'); }, this.data.longMs);
-      });
-      this.el.addEventListener('mouseup', () => {
-        down = false;
-        clearTimeout(pressTimer);
-        this.el.emit('tap');
-      });
-      this.el.addEventListener('touchstart', e => e.preventDefault(), {passive:false});
+  // ---------- CRITICAL: Gesture Detector ----------
+  // Detects pinch/rotate gestures and emits 'twofingermove'
+  AFRAME.registerComponent('gesture-detector', {
+    schema: { element: { default: '' } },
+    init: function() {
+      this.targetElement = this.data.element && document.querySelector(this.data.element);
+      if (!this.targetElement) { this.targetElement = this.el; }
+      this.internalState = { previousState: null };
+      this.emitGestureEvent = this.emitGestureEvent.bind(this);
+      this.targetElement.addEventListener("touchstart", this.emitGestureEvent);
+      this.targetElement.addEventListener("touchend", this.emitGestureEvent);
+      this.targetElement.addEventListener("touchmove", this.emitGestureEvent);
+    },
+    remove: function() {
+      this.targetElement.removeEventListener("touchstart", this.emitGestureEvent);
+      this.targetElement.removeEventListener("touchend", this.emitGestureEvent);
+      this.targetElement.removeEventListener("touchmove", this.emitGestureEvent);
+    },
+    emitGestureEvent: function(event) {
+      if (event.type === "touchstart") {
+        this.internalState.previousState = event.touches.length === 2 ? this.getTouchState(event) : null;
+        return;
+      }
+      if (event.type === "touchend") {
+        this.internalState.previousState = null;
+        return;
+      }
+      if (event.touches.length !== 2) return;
+      
+      const currentState = this.getTouchState(event);
+      const previousState = this.internalState.previousState;
+      if (previousState) {
+        const spreadChange = currentState.spread - previousState.spread;
+        const positionChange = {
+          x: currentState.position.x - previousState.position.x,
+          y: currentState.position.y - previousState.position.y
+        };
+        this.el.emit("twofingermove", {
+          positionChange: positionChange,
+          spreadChange: spreadChange,
+          startSpread: previousState.spread,
+          position: currentState.position
+        });
+      }
+      this.internalState.previousState = currentState;
+    },
+    getTouchState: function(event) {
+      if (event.touches.length < 2) return null;
+      const touch0 = event.touches[0];
+      const touch1 = event.touches[1];
+      const dx = touch0.clientX - touch1.clientX;
+      const dy = touch0.clientY - touch1.clientY;
+      return {
+        spread: Math.sqrt(dx * dx + dy * dy),
+        position: {
+          x: (touch0.clientX + touch1.clientX) / 2,
+          y: (touch0.clientY + touch1.clientY) / 2
+        }
+      };
     }
   });
 
-  // ---------- 2) Drag on a plane (marker plane) ----------
-  AFRAME.registerComponent('drag-on-plane', {
-    schema: { plane: {type: 'selector'}, yOffset: {default: 0.25}, radius: {default: 2.0} },
-    init () {
-      this.dragging = false;
-      this.scene = this.el.sceneEl;
-      this.rayEl = document.querySelector('#ray');
-      this.el.addEventListener('mousedown', () => this.dragging = true);
-      window.addEventListener('mouseup',   () => this.dragging = false);
-      window.addEventListener('touchend',  () => this.dragging = false);
-      this.scene.addEventListener('mousemove', (e)=> this.updateDrag());
-      this.scene.addEventListener('touchmove', (e)=> this.updateDrag());
-    },
-    updateDrag () {
-      if (!this.dragging) return;
-      if (!this.data.plane) return;
-      const raycaster = this.rayEl.getObject3D('raycaster');
-      if (!raycaster) return;
-      const planeMesh = this.data.plane.getObject3D('mesh');
-      if (!planeMesh) return;
+  // ---------- 1) Tap / Doubletap / Longpress (Mobile Fix) ----------
+  AFRAME.registerComponent('tap-gestures', {
+    schema: {longMs: {default: 500}},
+    init: function () {
+      let timer = null;
+      let lastTap = 0;
 
-      planeMesh.updateMatrixWorld();
-      const normal = new THREE.Vector3(0,1,0).applyQuaternion(planeMesh.getWorldQuaternion(new THREE.Quaternion()));
-      const point  = planeMesh.getWorldPosition(new THREE.Vector3());
-      const plane  = new THREE.Plane().setFromNormalAndCop_lanarPoint(normal, point);
+      const startHandler = (e) => {
+        const now = Date.now();
+        const timeSinceLastTap = now - lastTap;
 
-      const ray = raycaster.ray;
-      const hit = new THREE.Vector3();
-      if (ray.intersectPlane(plane, hit)) {
-        const local = this.el.parentEl.object3D.worldToLocal(hit.clone());
-        const r = Math.hypot(local.x, local.z);
-        const maxR = this.data.radius;
-        if (r > maxR){
-          const k = maxR / r;
-          local.x *= k; local.z *= k;
+        if (timeSinceLastTap < 300 && timeSinceLastTap > 0) {
+          this.el.emit('doubletap');
+          clearTimeout(timer); 
+        } else {
+          timer = setTimeout(() => {
+            this.el.emit('longpress');
+          }, this.data.longMs);
         }
-        this.el.setAttribute('position', `${local.x} ${this.data.yOffset} ${local.z}`);
+        lastTap = now;
+      };
+
+      const endHandler = (e) => {
+         clearTimeout(timer); 
+         if (Date.now() - lastTap < 300) {
+             this.el.emit('tap');
+         }
+      };
+
+      this.el.addEventListener('mousedown', startHandler);
+      this.el.addEventListener('touchstart', startHandler);
+      this.el.addEventListener('mouseup', endHandler);
+      this.el.addEventListener('touchend', endHandler);
+    }
+  });
+
+  // ---------- 2) Drag on a plane (Mobile Fix) ----------
+  AFRAME.registerComponent('drag-on-plane', {
+    schema: {
+      plane: {type: 'selector'},
+      yOffset: {default: 0.1},
+      radius: {default: 2.0}
+    },
+    init: function () {
+      this.isDragging = false;
+      this.raycaster = new THREE.Raycaster();
+      this.plane = this.data.plane.object3D;
+
+      this.el.addEventListener('mousedown', this.onDown.bind(this));
+      this.el.addEventListener('touchstart', this.onDown.bind(this));
+
+      window.addEventListener('mousemove', this.onMove.bind(this));
+      window.addEventListener('touchmove', this.onMove.bind(this));
+      
+      window.addEventListener('mouseup', this.onUp.bind(this));
+      window.addEventListener('touchend', this.onUp.bind(this));
+    },
+    onDown: function (e) {
+      if (e.touches && e.touches.length > 1) return; // Ignore multi-touch
+      this.isDragging = true;
+    },
+    onUp: function () {
+      this.isDragging = false;
+    },
+    onMove: function (e) {
+      if (!this.isDragging) return;
+      if (e.touches && e.touches.length > 1) return; // Ignore multi-touch
+
+      let clientX, clientY;
+      if (e.touches) {
+        clientX = e.touches[0].clientX;
+        clientY = e.touches[0].clientY;
+      } else {
+        clientX = e.clientX;
+        clientY = e.clientY;
+      }
+
+      const mouse = new THREE.Vector2();
+      mouse.x = (clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+
+      this.raycaster.setFromCamera(mouse, this.el.sceneEl.camera);
+      const intersects = this.raycaster.intersectObject(this.plane, true);
+
+      if (intersects.length > 0) {
+        let point = intersects[0].point;
+        this.el.parentEl.object3D.worldToLocal(point);
+
+        const dist = Math.sqrt(point.x * point.x + point.z * point.z);
+        if (dist > this.data.radius) {
+          const ratio = this.data.radius / dist;
+          point.x *= ratio;
+          point.z *= ratio;
+        }
+
+        this.el.setAttribute('position', {
+          x: point.x,
+          y: this.data.yOffset,
+          z: point.z
+        });
       }
     }
   });
 
-  // ---------- 3) Pinch to scale ----------
-  AFRAME.registerComponent('pinch-scale', {
-    schema: {min:{default:0.1}, max:{default:5}},
-    init(){
-      this.active = false; this.startD = 0; this.startScale = null;
-      const onStart = (e) => {
-        if (e.touches && e.touches.length === 2){
-          this.active = true;
-          this.startD = this.dist(e.touches[0], e.touches[1]);
-          this.startScale = Object.assign({}, this.el.getAttribute('scale'));
-        }
-      };
-      const onMove = (e) => {
-        if (!this.active || !e.touches || e.touches.length < 2) return;
-        const d = this.dist(e.touches[0], e.touches[1]);
-        const mult = d / this.startD;
-        const start = this.startScale;
-        const ns = {
-          x: clamp(start.x * mult, this.data.min * start.x, this.data.max * start.x),
-          y: clamp(start.y * mult, this.data.min * start.y, this.data.max * start.y),
-          z: clamp(start.z * mult, this.data.min * start.z, this.data.max * start.z),
-        };
-        this.el.setAttribute('scale', ns);
-      };
-      const onEnd = () => this.active = false;
-      window.addEventListener('touchstart', onStart, {passive:false});
-      window.addEventListener('touchmove',  onMove,  {passive:false});
-      window.addEventListener('touchend',   onEnd);
-      window.addEventListener('touchcancel',onEnd);
+  // ---------- 3 & 4) Combined Gesture Handler (Scale & Rotate) ----------
+  AFRAME.registerComponent('gesture-handler', {
+    schema: {
+      enabled: { default: true },
+      rotationFactor: { default: 5 },
+      minScale: { default: 0.1 },
+      maxScale: { default: 5 },
     },
-    dist(a,b){ const dx=a.clientX-b.clientX, dy=a.clientY-b.clientY; return Math.hypot(dx,dy); }
-  });
+    init: function () {
+      this.handleScale = this.handleScale.bind(this);
+      this.handleRotation = this.handleRotation.bind(this);
+      this.isVisible = false;
+      this.initialScale = this.el.object3D.scale.clone();
+      this.scaleFactor = 1;
 
-  // ---------- 4) Twist to rotate (two-finger) ----------
-  AFRAME.registerComponent('twist-rotate', {
-    schema:{degPerRad:{default:57.2958}},
-    init(){
-      this.active = false; this.startA = 0; this.startRotY = 0;
-      const angle = (a,b)=> Math.atan2(b.clientY-a.clientY, b.clientX-a.clientX);
-      const onStart = (e)=>{
-        if (e.touches && e.touches.length === 2){
-          this.active = true;
-          this.startA = angle(e.touches[0], e.touches[1]);
-          this.startRotY = this.el.getAttribute('rotation').y;
-        }
-      };
-      const onMove = (e)=>{
-        if (!this.active || !e.touches || e.touches.length < 2) return;
-        const a = angle(e.touches[0], e.touches[1]);
-        const delta = (a - this.startA) * this.data.degPerRad;
-        const r = this.el.getAttribute('rotation');
-        this.el.setAttribute('rotation', {x:r.x, y:this.startRotY + delta, z:r.z});
-      };
-      const onEnd = ()=> this.active = false;
-      window.addEventListener('touchstart', onStart, {passive:false});
-      window.addEventListener('touchmove',  onMove,  {passive:false});
-      window.addEventListener('touchend',   onEnd);
-      window.addEventListener('touchcancel',onEnd);
-    }
+      this.el.sceneEl.addEventListener("markerFound", (e) => {
+        if (e.target.contains(this.el)) this.isVisible = true;
+      });
+      this.el.sceneEl.addEventListener("markerLost", (e) => {
+        if (e.target.contains(this.el)) this.isVisible = false;
+      });
+    },
+    update: function () {
+      if (this.data.enabled) {
+        this.el.sceneEl.addEventListener("twofingermove", this.handleRotation);
+        this.el.sceneEl.addEventListener("twofingermove", this.handleScale);
+      } else {
+        this.el.sceneEl.removeEventListener("twofingermove", this.handleRotation);
+        this.el.sceneEl.removeEventListener("twofingermove", this.handleScale);
+      }
+    },
+    remove: function () {
+      this.el.sceneEl.removeEventListener("twofingermove", this.handleRotation);
+      this.el.sceneEl.removeEventListener("twofingermove", this.handleScale);
+    },
+    handleRotation: function (event) {
+      if (this.isVisible) {
+        this.el.object3D.rotation.y += event.detail.positionChange.x * this.data.rotationFactor;
+      }
+    },
+    handleScale: function (event) {
+      if (this.isVisible) {
+        this.scaleFactor *= 1 + event.detail.spreadChange / event.detail.startSpread;
+        this.scaleFactor = Math.min(Math.max(this.scaleFactor, this.data.minScale), this.data.maxScale);
+        this.el.object3D.scale.x = this.scaleFactor * this.initialScale.x;
+        this.el.object3D.scale.y = this.scaleFactor * this.initialScale.y;
+        this.el.object3D.scale.z = this.scaleFactor * this.initialScale.z;
+      }
+    },
   });
 
   // ---------- 5) Spin toggler + random color ----------
@@ -217,7 +306,6 @@
         }
       });
       this.el.addEventListener('random-color', ()=> {
-        // Only works if the entity has a material color component (like a-box)
         if (this.el.nodeName.toLowerCase() === 'a-box') {
           const colors = ['#4CC3D9','#FFC65D','#7BC8A4','#EF2D5E','#FFFFFF'];
           const c = colors[Math.floor(Math.random()*colors.length)];
@@ -239,11 +327,14 @@
 
   <a-scene
     embedded
+    gesture-detector
     renderer="colorManagement: true; physicallyCorrectLights: true"
     xr-mode-ui="enabled: false"
     arjs="sourceType: webcam; debugUIEnabled: false; detectionMode: mono_and_matrix; matrixCodeType: 3x3;">
 
-    <a-entity id="ray" cursor="rayOrigin: mouse" raycaster="objects: .raytarget"></a-entity>
+    <a-entity camera mouse-cursor position="0 0 0">
+        <a-entity cursor="fuse: false; rayOrigin: mouse;" raycaster="objects: .raytarget"></a-entity>
+    </a-entity>
 
     <a-entity light="type: ambient; intensity: 0.8"></a-entity>
     <a-entity light="type: directional; intensity: 0.6" position="0 1 1"></a-entity>
@@ -256,9 +347,10 @@
       <a-box id="cube" class="raytarget"
              position="0 0.25 0" depth="0.5" height="0.5" width="0.5"
              material="metalness:0.1; roughness:0.6; color:#4CC3D9"
-             tap-gestures spin-toggle
+             tap-gestures 
+             spin-toggle
              drag-on-plane="plane: #dragplane1; yOffset: 0.25; radius: 2.0"
-             pinch-scale twist-rotate>
+             gesture-handler="minScale: 0.2; maxScale: 3">
       </a-box>
     </a-marker>
     
@@ -270,17 +362,15 @@
       <a-gltf-model id="model" src="scene.gltf" class="raytarget"
               position="0 0.1 0" scale="0.1 0.1 0.1" 
               marker-logic
-              tap-gestures spin-toggle
+              tap-gestures 
+              spin-toggle
               drag-on-plane="plane: #dragplane2; yOffset: 0.1; radius: 2.0"
-              pinch-scale="min: 0.1; max: 5" 
-              twist-rotate>
+              gesture-handler="minScale: 0.05; maxScale: 2">
               
           <a-box color="red" position="0 0.5 0" scale="0.5 0.5 0.5"></a-box>
-          
       </a-gltf-model>
     </a-marker>
 
-    <a-entity camera></a-entity>
   </a-scene>
 
   <script>
@@ -306,9 +396,7 @@
 
     // --- HUD Button Logic ---
     function getActiveObject() {
-      // Prioritize model if visible
       if (model && model.getAttribute('visible') === true) return model;
-      // Fallback to cube if visible (technically marker1 usually visible first)
       if (cube) return cube;
       return null;
     }
